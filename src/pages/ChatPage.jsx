@@ -1,8 +1,11 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { getSettings } from '../stores/settings.js'
 import { db } from '../stores/db.js'
-import { streamChat } from '../lib/api-router.js'
+import { streamChat, buildMultimodalContent, fileToBase64 } from '../lib/api-router.js'
 import MessageBubble from '../components/MessageBubble.jsx'
+
+const MAX_IMAGE_SIZE = 20 * 1024 * 1024 // 20MB
+const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
 
 export default function ChatPage() {
   const [messages, setMessages] = useState([])
@@ -13,9 +16,16 @@ export default function ChatPage() {
   const [activeConv, setActiveConv] = useState(null)
   const [error, setError] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [attachedImages, setAttachedImages] = useState([]) // {file, preview, base64, mimeType}
+  const [searchQuery, setSearchQuery] = useState('')
+  const [editingConvId, setEditingConvId] = useState(null)
+  const [editTitle, setEditTitle] = useState('')
+  const [retryInfo, setRetryInfo] = useState(null) // {countdown, message}
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
   const abortRef = useRef(null)
+  const fileInputRef = useRef(null)
+  const retryTimerRef = useRef(null)
 
   useEffect(() => {
     loadConversations()
@@ -24,6 +34,13 @@ export default function ChatPage() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, streamingText])
+
+  useEffect(() => {
+    return () => {
+      if (retryTimerRef.current) clearInterval(retryTimerRef.current)
+      attachedImages.forEach(img => URL.revokeObjectURL(img.preview))
+    }
+  }, [])
 
   async function loadConversations() {
     const convs = await db.conversations.orderBy('updatedAt').reverse().toArray()
@@ -35,6 +52,7 @@ export default function ChatPage() {
     const msgs = await db.messages.where('conversationId').equals(conv.id).sortBy('createdAt')
     setMessages(msgs)
     setError(null)
+    setRetryInfo(null)
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
@@ -43,6 +61,8 @@ export default function ChatPage() {
     setMessages([])
     setStreamingText('')
     setError(null)
+    setRetryInfo(null)
+    setAttachedImages([])
     inputRef.current?.focus()
   }
 
@@ -53,8 +73,104 @@ export default function ChatPage() {
     }
   }
 
+  // ─── File Upload ────────────────────────────────────────
+
+  async function processFiles(files) {
+    const newImages = []
+    for (const file of files) {
+      if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+        setError(`Unsupported file type: ${file.type}. Supported: PNG, JPEG, GIF, WebP`)
+        continue
+      }
+      if (file.size > MAX_IMAGE_SIZE) {
+        setError(`File too large: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: 20MB`)
+        continue
+      }
+      const base64 = await fileToBase64(file)
+      newImages.push({
+        file,
+        preview: URL.createObjectURL(file),
+        base64,
+        mimeType: file.type,
+      })
+    }
+    setAttachedImages(prev => [...prev, ...newImages])
+  }
+
+  function removeImage(index) {
+    setAttachedImages(prev => {
+      const updated = [...prev]
+      URL.revokeObjectURL(updated[index].preview)
+      updated.splice(index, 1)
+      return updated
+    })
+  }
+
+  function handleDrop(e) {
+    e.preventDefault()
+    e.stopPropagation()
+    const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'))
+    if (files.length) processFiles(files)
+  }
+
+  function handleDragOver(e) {
+    e.preventDefault()
+    e.stopPropagation()
+  }
+
+  function handlePaste(e) {
+    const items = Array.from(e.clipboardData.items)
+    const imageItems = items.filter(item => item.type.startsWith('image/'))
+    if (imageItems.length) {
+      e.preventDefault()
+      const files = imageItems.map(item => item.getAsFile()).filter(Boolean)
+      processFiles(files)
+    }
+  }
+
+  // ─── Conversation Management ────────────────────────────
+
+  async function handleRenameConversation(convId, newTitle) {
+    if (!newTitle.trim()) return
+    await db.conversations.update(convId, { title: newTitle.trim() })
+    if (activeConv?.id === convId) {
+      setActiveConv(prev => ({ ...prev, title: newTitle.trim() }))
+    }
+    setEditingConvId(null)
+    loadConversations()
+  }
+
+  async function handlePinConversation(e, convId) {
+    e.stopPropagation()
+    const conv = await db.conversations.get(convId)
+    await db.conversations.update(convId, { pinned: !conv.pinned })
+    loadConversations()
+  }
+
+  async function handleDeleteConversation(e, convId) {
+    e.stopPropagation()
+    await db.messages.where('conversationId').equals(convId).delete()
+    await db.conversations.delete(convId)
+    if (activeConv?.id === convId) {
+      setActiveConv(null)
+      setMessages([])
+    }
+    loadConversations()
+  }
+
+  // Filter and sort conversations
+  const filteredConversations = conversations
+    .filter(c => !searchQuery || c.title.toLowerCase().includes(searchQuery.toLowerCase()))
+    .sort((a, b) => {
+      if (a.pinned && !b.pinned) return -1
+      if (!a.pinned && b.pinned) return 1
+      return 0 // already sorted by updatedAt from DB
+    })
+
+  // ─── Send Message ───────────────────────────────────────
+
   async function handleSend() {
-    if (!input.trim() || loading) return
+    if ((!input.trim() && attachedImages.length === 0) || loading) return
 
     const settings = getSettings()
     if (!settings.activeProvider || !settings.activeModel) {
@@ -69,18 +185,29 @@ export default function ChatPage() {
     }
 
     const userText = input.trim()
-    const userMsg = { role: 'user', content: userText, createdAt: Date.now() }
+    const images = [...attachedImages]
+
+    // Build display content (text + image indicators)
+    let displayContent = userText
+    if (images.length > 0) {
+      const imgLabels = images.map(img => `[Image: ${img.file.name}]`).join(' ')
+      displayContent = displayContent ? `${displayContent}\n${imgLabels}` : imgLabels
+    }
+
+    const userMsg = { role: 'user', content: displayContent, createdAt: Date.now() }
     setMessages(prev => [...prev, userMsg])
     setInput('')
+    setAttachedImages([])
     setLoading(true)
     setError(null)
+    setRetryInfo(null)
     setStreamingText('')
 
     // Create or get conversation
     let convId = activeConv?.id
     if (!convId) {
       convId = await db.conversations.add({
-        title: userText.slice(0, 50) + (userText.length > 50 ? '...' : ''),
+        title: (userText || 'Image chat').slice(0, 50) + (userText.length > 50 ? '...' : ''),
         model: settings.activeModel,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -96,7 +223,7 @@ export default function ChatPage() {
     const history = await db.messages.where('conversationId').equals(convId).sortBy('createdAt')
     const apiMessages = []
 
-    // Inject memories as system context
+    // System prompt + memories
     const memories = await db.memories.toArray()
     let systemPrompt = 'You are a helpful AI assistant.'
     if (memories.length > 0) {
@@ -105,8 +232,17 @@ export default function ChatPage() {
     }
     apiMessages.push({ role: 'system', content: systemPrompt })
 
-    for (const msg of history) {
-      apiMessages.push({ role: msg.role, content: msg.content })
+    // Add history (without multimodal for old messages)
+    for (let i = 0; i < history.length - 1; i++) {
+      apiMessages.push({ role: history[i].role, content: history[i].content })
+    }
+
+    // Last user message with images if present
+    if (images.length > 0) {
+      const multimodalContent = buildMultimodalContent(userText, images, settings.activeProvider)
+      apiMessages.push({ role: 'user', content: multimodalContent })
+    } else {
+      apiMessages.push({ role: 'user', content: userText })
     }
 
     // Stream response
@@ -125,7 +261,6 @@ export default function ChatPage() {
         signal: abort.signal,
       })
 
-      // Save assistant message
       const assistantMsg = { role: 'assistant', content: fullText, createdAt: Date.now(), conversationId: convId }
       await db.messages.add(assistantMsg)
       await db.conversations.update(convId, { updatedAt: Date.now() })
@@ -135,16 +270,31 @@ export default function ChatPage() {
       loadConversations()
     } catch (err) {
       if (err.name !== 'AbortError') {
+        const classified = err.classified
         setError(err.message)
-        // Save partial response if any
-        const partial = streamingText
-        if (partial) {
-          const assistantMsg = { role: 'assistant', content: partial + '\n\n[Response interrupted]', createdAt: Date.now(), conversationId: convId }
+
+        // Show retry countdown for retryable errors
+        if (classified?.retryable && classified.retryAfter) {
+          let countdown = classified.retryAfter
+          setRetryInfo({ countdown, message: `Retrying in ${countdown}s...` })
+          retryTimerRef.current = setInterval(() => {
+            countdown--
+            if (countdown <= 0) {
+              clearInterval(retryTimerRef.current)
+              setRetryInfo(null)
+            } else {
+              setRetryInfo({ countdown, message: `Retrying in ${countdown}s...` })
+            }
+          }, 1000)
+        }
+
+        // Save partial response if any streaming text accumulated
+        if (streamingText) {
+          const assistantMsg = { role: 'assistant', content: streamingText + '\n\n[Response interrupted]', createdAt: Date.now(), conversationId: convId }
           await db.messages.add(assistantMsg)
           setMessages(prev => [...prev, assistantMsg])
         }
       } else if (streamingText) {
-        // Aborted by user — save partial
         const assistantMsg = { role: 'assistant', content: streamingText, createdAt: Date.now(), conversationId: convId }
         await db.messages.add(assistantMsg)
         setMessages(prev => [...prev, assistantMsg])
@@ -154,17 +304,6 @@ export default function ChatPage() {
       setLoading(false)
       abortRef.current = null
     }
-  }
-
-  async function handleDeleteConversation(e, convId) {
-    e.stopPropagation()
-    await db.messages.where('conversationId').equals(convId).delete()
-    await db.conversations.delete(convId)
-    if (activeConv?.id === convId) {
-      setActiveConv(null)
-      setMessages([])
-    }
-    loadConversations()
   }
 
   function handleKeyDown(e) {
@@ -179,40 +318,83 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full">
-      {/* Conversation list sidebar - collapsible on mobile */}
+      {/* Conversation sidebar */}
       <div className={`${sidebarOpen ? 'w-64' : 'w-0'} flex flex-col border-r transition-all duration-200 overflow-hidden md:w-64`}
         style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-secondary)' }}>
-        <div className="p-3 min-w-[256px]">
+        <div className="p-3 min-w-[256px] space-y-2">
           <button onClick={newChat}
             className="w-full py-2 px-3 rounded-lg text-sm font-medium transition-colors cursor-pointer"
             style={{ background: 'var(--accent)', color: '#fff' }}>
             + New Chat
           </button>
+          {/* Search */}
+          <div className="relative">
+            <svg className="absolute left-2.5 top-2.5 w-3.5 h-3.5" style={{ color: 'var(--text-muted)' }}
+              viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            <input
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              placeholder="Search chats..."
+              className="w-full pl-8 pr-3 py-1.5 rounded-lg text-xs bg-transparent outline-none"
+              style={{ border: '1px solid var(--border-subtle)', color: 'var(--text-primary)' }}
+            />
+          </div>
         </div>
         <div className="flex-1 overflow-y-auto px-2 min-w-[256px]">
-          {conversations.map(conv => (
+          {filteredConversations.map(conv => (
             <div key={conv.id}
-              onClick={() => selectConversation(conv)}
-              className="group w-full text-left px-3 py-2 rounded-lg mb-1 text-sm truncate transition-colors cursor-pointer flex items-center justify-between"
+              onClick={() => editingConvId !== conv.id && selectConversation(conv)}
+              className="group w-full text-left px-3 py-2 rounded-lg mb-1 text-sm transition-colors cursor-pointer flex items-center gap-1"
               style={{
                 background: activeConv?.id === conv.id ? 'var(--bg-glass-hover)' : 'transparent',
                 color: activeConv?.id === conv.id ? 'var(--text-primary)' : 'var(--text-secondary)',
                 border: activeConv?.id === conv.id ? '1px solid var(--border-accent)' : '1px solid transparent',
               }}>
-              <span className="truncate">{conv.title}</span>
-              <button
-                onClick={(e) => handleDeleteConversation(e, conv.id)}
-                className="opacity-0 group-hover:opacity-100 text-xs px-1 rounded cursor-pointer flex-shrink-0"
-                style={{ color: 'var(--danger)' }}>
-                ×
-              </button>
+              {/* Pin indicator */}
+              {conv.pinned && <span className="text-[10px] flex-shrink-0" style={{ color: 'var(--accent)' }}>📌</span>}
+
+              {/* Title (editable) */}
+              {editingConvId === conv.id ? (
+                <input
+                  autoFocus
+                  value={editTitle}
+                  onChange={e => setEditTitle(e.target.value)}
+                  onBlur={() => handleRenameConversation(conv.id, editTitle)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') handleRenameConversation(conv.id, editTitle)
+                    if (e.key === 'Escape') setEditingConvId(null)
+                  }}
+                  onClick={e => e.stopPropagation()}
+                  className="flex-1 bg-transparent outline-none text-xs px-1 rounded"
+                  style={{ border: '1px solid var(--border-accent)', color: 'var(--text-primary)' }}
+                />
+              ) : (
+                <span className="truncate flex-1">{conv.title}</span>
+              )}
+
+              {/* Actions */}
+              <div className="opacity-0 group-hover:opacity-100 flex gap-0.5 flex-shrink-0">
+                <button onClick={(e) => { e.stopPropagation(); setEditingConvId(conv.id); setEditTitle(conv.title) }}
+                  className="text-[10px] px-1 rounded cursor-pointer" style={{ color: 'var(--text-muted)' }}
+                  title="Rename">✏️</button>
+                <button onClick={(e) => handlePinConversation(e, conv.id)}
+                  className="text-[10px] px-1 rounded cursor-pointer" style={{ color: 'var(--text-muted)' }}
+                  title={conv.pinned ? 'Unpin' : 'Pin'}>📌</button>
+                <button onClick={(e) => handleDeleteConversation(e, conv.id)}
+                  className="text-[10px] px-1 rounded cursor-pointer" style={{ color: 'var(--danger)' }}
+                  title="Delete">×</button>
+              </div>
             </div>
           ))}
         </div>
       </div>
 
       {/* Chat area */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0"
+        onDrop={handleDrop}
+        onDragOver={handleDragOver}>
         {/* Header */}
         <div className="h-14 flex items-center px-4 md:px-6 border-b gap-3"
           style={{ borderColor: 'var(--border-subtle)' }}>
@@ -247,7 +429,7 @@ export default function ChatPage() {
               </h2>
               <p className="text-sm text-center px-4" style={{ color: 'var(--text-muted)' }}>
                 {hasProvider
-                  ? 'Start a conversation with your AI assistant.'
+                  ? 'Start a conversation. Drop images or paste screenshots to chat with vision.'
                   : 'Configure an AI provider in Settings to get started.'}
               </p>
             </div>
@@ -257,12 +439,10 @@ export default function ChatPage() {
             <MessageBubble key={i} role={msg.role} content={msg.content} createdAt={msg.createdAt} />
           ))}
 
-          {/* Streaming response with markdown */}
           {streamingText && (
             <MessageBubble role="assistant" content={streamingText + ' ▊'} createdAt={Date.now()} />
           )}
 
-          {/* Loading indicator (before streaming starts) */}
           {loading && !streamingText && (
             <div className="mb-4 flex justify-start">
               <div className="px-4 py-3 rounded-2xl text-sm"
@@ -276,24 +456,65 @@ export default function ChatPage() {
             </div>
           )}
 
-          {/* Error display */}
+          {/* Error display with retry info */}
           {error && (
-            <MessageBubble role="system" content={error} createdAt={Date.now()} />
+            <div className="mb-4 flex justify-start">
+              <div className="max-w-[75%] px-4 py-3 rounded-2xl text-sm"
+                style={{ background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', color: '#ef4444' }}>
+                <div>{error}</div>
+                {retryInfo && (
+                  <div className="mt-2 text-xs" style={{ color: 'var(--text-muted)' }}>
+                    {retryInfo.message}
+                  </div>
+                )}
+              </div>
+            </div>
           )}
 
           <div ref={messagesEndRef} />
         </div>
 
+        {/* Image previews */}
+        {attachedImages.length > 0 && (
+          <div className="px-4 md:px-6 pt-2 flex gap-2 flex-wrap">
+            {attachedImages.map((img, i) => (
+              <div key={i} className="relative group">
+                <img src={img.preview} alt="" className="w-16 h-16 object-cover rounded-lg border"
+                  style={{ borderColor: 'var(--border-subtle)' }} />
+                <button onClick={() => removeImage(i)}
+                  className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center text-xs cursor-pointer"
+                  style={{ background: 'var(--danger)', color: '#fff' }}>
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Input area */}
         <div className="px-4 md:px-6 pb-4 pt-2">
           <div className="flex gap-3 items-end p-3 rounded-2xl"
             style={{ background: 'var(--bg-glass)', border: '1px solid var(--border-subtle)' }}>
+            {/* File upload button */}
+            <button onClick={() => fileInputRef.current?.click()}
+              className="w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer flex-shrink-0"
+              style={{ color: 'var(--text-muted)' }}
+              title="Attach image">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+              </svg>
+            </button>
+            <input ref={fileInputRef} type="file" accept="image/*" multiple hidden
+              onChange={e => { if (e.target.files.length) processFiles(Array.from(e.target.files)); e.target.value = '' }}
+            />
+
             <textarea
               ref={inputRef}
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={hasProvider ? 'Type a message...' : 'Configure a provider in Settings first'}
+              onPaste={handlePaste}
+              placeholder={hasProvider ? 'Type a message... (drop or paste images)' : 'Configure a provider in Settings first'}
               disabled={!hasProvider || loading}
               rows={1}
               className="flex-1 bg-transparent border-none outline-none text-sm resize-none"
@@ -313,11 +534,11 @@ export default function ChatPage() {
               </button>
             ) : (
               <button onClick={handleSend}
-                disabled={!input.trim() || !hasProvider}
+                disabled={(!input.trim() && attachedImages.length === 0) || !hasProvider}
                 className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors cursor-pointer flex-shrink-0"
                 style={{
-                  background: input.trim() && hasProvider ? 'var(--accent)' : 'var(--bg-tertiary)',
-                  color: input.trim() && hasProvider ? '#fff' : 'var(--text-muted)',
+                  background: (input.trim() || attachedImages.length > 0) && hasProvider ? 'var(--accent)' : 'var(--bg-tertiary)',
+                  color: (input.trim() || attachedImages.length > 0) && hasProvider ? '#fff' : 'var(--text-muted)',
                 }}>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <line x1="22" y1="2" x2="11" y2="13" />

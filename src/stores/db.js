@@ -8,3 +8,10 @@ db.version(1).stores({
   memories: '++id, title, content, createdAt',
   tasks: '++id, title, status, createdAt, updatedAt',
 })
+
+db.version(2).stores({
+  conversations: '++id, title, model, pinned, createdAt, updatedAt',
+  messages: '++id, conversationId, role, content, createdAt',
+  memories: '++id, title, content, createdAt',
+  tasks: '++id, title, status, createdAt, updatedAt',
+})
