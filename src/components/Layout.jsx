@@ -8,13 +8,13 @@ const navItems = [
 
 export default function Layout() {
   return (
-    <div className="flex h-screen w-full">
-      {/* Sidebar */}
-      <aside className="w-16 flex flex-col items-center py-4 gap-2 border-r"
+    <div className="flex flex-col md:flex-row h-screen w-full">
+      {/* Sidebar - bottom bar on mobile, left rail on desktop */}
+      <aside className="order-2 md:order-1 flex md:flex-col items-center justify-around md:justify-start py-2 md:py-4 px-4 md:px-0 gap-2 border-t md:border-t-0 md:border-r md:w-16"
         style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-secondary)' }}>
 
-        {/* Logo */}
-        <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-4 font-bold text-lg"
+        {/* Logo - hidden on mobile */}
+        <div className="hidden md:flex w-10 h-10 rounded-xl items-center justify-center mb-4 font-bold text-lg"
           style={{ background: 'var(--accent)', color: '#fff' }}>
           E
         </div>
@@ -40,7 +40,7 @@ export default function Layout() {
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 flex flex-col overflow-hidden"
+      <main className="order-1 md:order-2 flex-1 flex flex-col overflow-hidden"
         style={{ background: 'var(--bg-primary)' }}>
         <Outlet />
       </main>

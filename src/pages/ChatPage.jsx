@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { getSettings } from '../stores/settings.js'
 import { db } from '../stores/db.js'
 import { streamChat } from '../lib/api-router.js'
+import MessageBubble from '../components/MessageBubble.jsx'
 
 export default function ChatPage() {
   const [messages, setMessages] = useState([])
@@ -11,6 +12,7 @@ export default function ChatPage() {
   const [conversations, setConversations] = useState([])
   const [activeConv, setActiveConv] = useState(null)
   const [error, setError] = useState(null)
+  const [sidebarOpen, setSidebarOpen] = useState(true)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
   const abortRef = useRef(null)
@@ -33,6 +35,7 @@ export default function ChatPage() {
     const msgs = await db.messages.where('conversationId').equals(conv.id).sortBy('createdAt')
     setMessages(msgs)
     setError(null)
+    if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
   async function newChat() {
@@ -176,17 +179,17 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full">
-      {/* Conversation list sidebar */}
-      <div className="w-64 flex flex-col border-r"
+      {/* Conversation list sidebar - collapsible on mobile */}
+      <div className={`${sidebarOpen ? 'w-64' : 'w-0'} flex flex-col border-r transition-all duration-200 overflow-hidden md:w-64`}
         style={{ borderColor: 'var(--border-subtle)', background: 'var(--bg-secondary)' }}>
-        <div className="p-3">
+        <div className="p-3 min-w-[256px]">
           <button onClick={newChat}
             className="w-full py-2 px-3 rounded-lg text-sm font-medium transition-colors cursor-pointer"
             style={{ background: 'var(--accent)', color: '#fff' }}>
             + New Chat
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto px-2">
+        <div className="flex-1 overflow-y-auto px-2 min-w-[256px]">
           {conversations.map(conv => (
             <div key={conv.id}
               onClick={() => selectConversation(conv)}
@@ -209,15 +212,22 @@ export default function ChatPage() {
       </div>
 
       {/* Chat area */}
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 flex flex-col min-w-0">
         {/* Header */}
-        <div className="h-14 flex items-center px-6 border-b"
+        <div className="h-14 flex items-center px-4 md:px-6 border-b gap-3"
           style={{ borderColor: 'var(--border-subtle)' }}>
-          <span className="text-sm font-medium" style={{ color: 'var(--text-secondary)' }}>
+          <button onClick={() => setSidebarOpen(!sidebarOpen)}
+            className="md:hidden w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer flex-shrink-0"
+            style={{ color: 'var(--text-muted)' }}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
+            </svg>
+          </button>
+          <span className="text-sm font-medium truncate" style={{ color: 'var(--text-secondary)' }}>
             {activeConv ? activeConv.title : 'New Chat'}
           </span>
           {settings.activeModel && (
-            <span className="ml-3 text-xs px-2 py-0.5 rounded-full"
+            <span className="text-xs px-2 py-0.5 rounded-full flex-shrink-0"
               style={{ background: 'var(--accent-glow)', color: 'var(--accent-hover)' }}>
               {settings.activeModel}
             </span>
@@ -225,7 +235,7 @@ export default function ChatPage() {
         </div>
 
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-6 py-4">
+        <div className="flex-1 overflow-y-auto px-4 md:px-6 py-4">
           {messages.length === 0 && !streamingText && (
             <div className="h-full flex flex-col items-center justify-center gap-4">
               <div className="w-16 h-16 rounded-2xl flex items-center justify-center text-2xl font-bold"
@@ -235,7 +245,7 @@ export default function ChatPage() {
               <h2 className="text-xl font-semibold" style={{ color: 'var(--text-primary)' }}>
                 Easy AI
               </h2>
-              <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+              <p className="text-sm text-center px-4" style={{ color: 'var(--text-muted)' }}>
                 {hasProvider
                   ? 'Start a conversation with your AI assistant.'
                   : 'Configure an AI provider in Settings to get started.'}
@@ -244,27 +254,12 @@ export default function ChatPage() {
           )}
 
           {messages.map((msg, i) => (
-            <div key={i} className={`mb-4 flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className="max-w-[70%] px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap"
-                style={{
-                  background: msg.role === 'user' ? 'var(--accent)' : 'var(--bg-glass)',
-                  color: msg.role === 'user' ? '#fff' : 'var(--text-primary)',
-                  border: msg.role === 'user' ? 'none' : '1px solid var(--border-subtle)',
-                }}>
-                {msg.content}
-              </div>
-            </div>
+            <MessageBubble key={i} role={msg.role} content={msg.content} createdAt={msg.createdAt} />
           ))}
 
-          {/* Streaming response */}
+          {/* Streaming response with markdown */}
           {streamingText && (
-            <div className="mb-4 flex justify-start">
-              <div className="max-w-[70%] px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap"
-                style={{ background: 'var(--bg-glass)', border: '1px solid var(--border-subtle)', color: 'var(--text-primary)' }}>
-                {streamingText}
-                <span className="animate-pulse ml-0.5">▊</span>
-              </div>
-            </div>
+            <MessageBubble role="assistant" content={streamingText + ' ▊'} createdAt={Date.now()} />
           )}
 
           {/* Loading indicator (before streaming starts) */}
@@ -272,26 +267,25 @@ export default function ChatPage() {
             <div className="mb-4 flex justify-start">
               <div className="px-4 py-3 rounded-2xl text-sm"
                 style={{ background: 'var(--bg-glass)', border: '1px solid var(--border-subtle)', color: 'var(--text-muted)' }}>
-                <span className="animate-pulse">Thinking...</span>
+                <div className="flex gap-1">
+                  <span className="w-2 h-2 rounded-full animate-bounce" style={{ background: 'var(--accent)', animationDelay: '0ms' }} />
+                  <span className="w-2 h-2 rounded-full animate-bounce" style={{ background: 'var(--accent)', animationDelay: '150ms' }} />
+                  <span className="w-2 h-2 rounded-full animate-bounce" style={{ background: 'var(--accent)', animationDelay: '300ms' }} />
+                </div>
               </div>
             </div>
           )}
 
           {/* Error display */}
           {error && (
-            <div className="mb-4 flex justify-start">
-              <div className="max-w-[70%] px-4 py-3 rounded-2xl text-sm"
-                style={{ background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', color: '#ef4444' }}>
-                {error}
-              </div>
-            </div>
+            <MessageBubble role="system" content={error} createdAt={Date.now()} />
           )}
 
           <div ref={messagesEndRef} />
         </div>
 
         {/* Input area */}
-        <div className="px-6 pb-4 pt-2">
+        <div className="px-4 md:px-6 pb-4 pt-2">
           <div className="flex gap-3 items-end p-3 rounded-2xl"
             style={{ background: 'var(--bg-glass)', border: '1px solid var(--border-subtle)' }}>
             <textarea
