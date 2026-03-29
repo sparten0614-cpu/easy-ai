@@ -1,15 +1,19 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { getSettings } from '../stores/settings.js'
 import { db } from '../stores/db.js'
+import { streamChat } from '../lib/api-router.js'
 
 export default function ChatPage() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [streamingText, setStreamingText] = useState('')
   const [conversations, setConversations] = useState([])
   const [activeConv, setActiveConv] = useState(null)
+  const [error, setError] = useState(null)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
+  const abortRef = useRef(null)
 
   useEffect(() => {
     loadConversations()
@@ -17,7 +21,7 @@ export default function ChatPage() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, streamingText])
 
   async function loadConversations() {
     const convs = await db.conversations.orderBy('updatedAt').reverse().toArray()
@@ -26,14 +30,24 @@ export default function ChatPage() {
 
   async function selectConversation(conv) {
     setActiveConv(conv)
-    const msgs = await db.messages.where('conversationId').equals(conv.id).toArray()
+    const msgs = await db.messages.where('conversationId').equals(conv.id).sortBy('createdAt')
     setMessages(msgs)
+    setError(null)
   }
 
   async function newChat() {
     setActiveConv(null)
     setMessages([])
+    setStreamingText('')
+    setError(null)
     inputRef.current?.focus()
+  }
+
+  function handleStop() {
+    if (abortRef.current) {
+      abortRef.current.abort()
+      abortRef.current = null
+    }
   }
 
   async function handleSend() {
@@ -41,23 +55,29 @@ export default function ChatPage() {
 
     const settings = getSettings()
     if (!settings.activeProvider || !settings.activeModel) {
-      setMessages(prev => [...prev, {
-        role: 'system',
-        content: 'Please configure an AI provider in Settings first.',
-        createdAt: Date.now(),
-      }])
+      setError('Please configure an AI provider in Settings first.')
       return
     }
 
-    const userMsg = { role: 'user', content: input.trim(), createdAt: Date.now() }
+    const provider = settings.providers.find(p => p.id === settings.activeProvider)
+    if (!provider) {
+      setError('Active provider not found. Please reconfigure in Settings.')
+      return
+    }
+
+    const userText = input.trim()
+    const userMsg = { role: 'user', content: userText, createdAt: Date.now() }
     setMessages(prev => [...prev, userMsg])
     setInput('')
     setLoading(true)
+    setError(null)
+    setStreamingText('')
 
+    // Create or get conversation
     let convId = activeConv?.id
     if (!convId) {
       convId = await db.conversations.add({
-        title: input.trim().slice(0, 50),
+        title: userText.slice(0, 50) + (userText.length > 50 ? '...' : ''),
         model: settings.activeModel,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -69,17 +89,79 @@ export default function ChatPage() {
 
     await db.messages.add({ ...userMsg, conversationId: convId })
 
-    // Placeholder for AI response - will be replaced with actual API call
-    const assistantMsg = {
-      role: 'assistant',
-      content: `[API call placeholder — provider: ${settings.activeProvider}, model: ${settings.activeModel}]\n\nThis is where the AI response will appear. The API integration layer will be built by the core logic team.`,
-      createdAt: Date.now(),
+    // Build messages array for API
+    const history = await db.messages.where('conversationId').equals(convId).sortBy('createdAt')
+    const apiMessages = []
+
+    // Inject memories as system context
+    const memories = await db.memories.toArray()
+    let systemPrompt = 'You are a helpful AI assistant.'
+    if (memories.length > 0) {
+      const memoryLines = memories.map(m => `- ${m.title}: ${m.content}`).join('\n')
+      systemPrompt += `\n\nUser's saved notes:\n${memoryLines}`
+    }
+    apiMessages.push({ role: 'system', content: systemPrompt })
+
+    for (const msg of history) {
+      apiMessages.push({ role: msg.role, content: msg.content })
     }
 
-    await db.messages.add({ ...assistantMsg, conversationId: convId })
-    await db.conversations.update(convId, { updatedAt: Date.now() })
-    setMessages(prev => [...prev, assistantMsg])
-    setLoading(false)
+    // Stream response
+    const abort = new AbortController()
+    abortRef.current = abort
+
+    try {
+      const fullText = await streamChat({
+        provider,
+        model: settings.activeModel,
+        messages: apiMessages,
+        options: { temperature: 0.7 },
+        onToken: (token) => {
+          setStreamingText(prev => prev + token)
+        },
+        signal: abort.signal,
+      })
+
+      // Save assistant message
+      const assistantMsg = { role: 'assistant', content: fullText, createdAt: Date.now(), conversationId: convId }
+      await db.messages.add(assistantMsg)
+      await db.conversations.update(convId, { updatedAt: Date.now() })
+
+      setMessages(prev => [...prev, { role: 'assistant', content: fullText, createdAt: Date.now() }])
+      setStreamingText('')
+      loadConversations()
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        setError(err.message)
+        // Save partial response if any
+        const partial = streamingText
+        if (partial) {
+          const assistantMsg = { role: 'assistant', content: partial + '\n\n[Response interrupted]', createdAt: Date.now(), conversationId: convId }
+          await db.messages.add(assistantMsg)
+          setMessages(prev => [...prev, assistantMsg])
+        }
+      } else if (streamingText) {
+        // Aborted by user — save partial
+        const assistantMsg = { role: 'assistant', content: streamingText, createdAt: Date.now(), conversationId: convId }
+        await db.messages.add(assistantMsg)
+        setMessages(prev => [...prev, assistantMsg])
+      }
+      setStreamingText('')
+    } finally {
+      setLoading(false)
+      abortRef.current = null
+    }
+  }
+
+  async function handleDeleteConversation(e, convId) {
+    e.stopPropagation()
+    await db.messages.where('conversationId').equals(convId).delete()
+    await db.conversations.delete(convId)
+    if (activeConv?.id === convId) {
+      setActiveConv(null)
+      setMessages([])
+    }
+    loadConversations()
   }
 
   function handleKeyDown(e) {
@@ -106,16 +188,22 @@ export default function ChatPage() {
         </div>
         <div className="flex-1 overflow-y-auto px-2">
           {conversations.map(conv => (
-            <button key={conv.id}
+            <div key={conv.id}
               onClick={() => selectConversation(conv)}
-              className="w-full text-left px-3 py-2 rounded-lg mb-1 text-sm truncate transition-colors cursor-pointer"
+              className="group w-full text-left px-3 py-2 rounded-lg mb-1 text-sm truncate transition-colors cursor-pointer flex items-center justify-between"
               style={{
                 background: activeConv?.id === conv.id ? 'var(--bg-glass-hover)' : 'transparent',
                 color: activeConv?.id === conv.id ? 'var(--text-primary)' : 'var(--text-secondary)',
                 border: activeConv?.id === conv.id ? '1px solid var(--border-accent)' : '1px solid transparent',
               }}>
-              {conv.title}
-            </button>
+              <span className="truncate">{conv.title}</span>
+              <button
+                onClick={(e) => handleDeleteConversation(e, conv.id)}
+                className="opacity-0 group-hover:opacity-100 text-xs px-1 rounded cursor-pointer flex-shrink-0"
+                style={{ color: 'var(--danger)' }}>
+                ×
+              </button>
+            </div>
           ))}
         </div>
       </div>
@@ -138,7 +226,7 @@ export default function ChatPage() {
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-4">
-          {messages.length === 0 && (
+          {messages.length === 0 && !streamingText && (
             <div className="h-full flex flex-col items-center justify-center gap-4">
               <div className="w-16 h-16 rounded-2xl flex items-center justify-center text-2xl font-bold"
                 style={{ background: 'var(--accent-glow)', color: 'var(--accent)' }}>
@@ -168,7 +256,19 @@ export default function ChatPage() {
             </div>
           ))}
 
-          {loading && (
+          {/* Streaming response */}
+          {streamingText && (
+            <div className="mb-4 flex justify-start">
+              <div className="max-w-[70%] px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap"
+                style={{ background: 'var(--bg-glass)', border: '1px solid var(--border-subtle)', color: 'var(--text-primary)' }}>
+                {streamingText}
+                <span className="animate-pulse ml-0.5">▊</span>
+              </div>
+            </div>
+          )}
+
+          {/* Loading indicator (before streaming starts) */}
+          {loading && !streamingText && (
             <div className="mb-4 flex justify-start">
               <div className="px-4 py-3 rounded-2xl text-sm"
                 style={{ background: 'var(--bg-glass)', border: '1px solid var(--border-subtle)', color: 'var(--text-muted)' }}>
@@ -176,6 +276,17 @@ export default function ChatPage() {
               </div>
             </div>
           )}
+
+          {/* Error display */}
+          {error && (
+            <div className="mb-4 flex justify-start">
+              <div className="max-w-[70%] px-4 py-3 rounded-2xl text-sm"
+                style={{ background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', color: '#ef4444' }}>
+                {error}
+              </div>
+            </div>
+          )}
+
           <div ref={messagesEndRef} />
         </div>
 
@@ -189,7 +300,7 @@ export default function ChatPage() {
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder={hasProvider ? 'Type a message...' : 'Configure a provider in Settings first'}
-              disabled={!hasProvider}
+              disabled={!hasProvider || loading}
               rows={1}
               className="flex-1 bg-transparent border-none outline-none text-sm resize-none"
               style={{ color: 'var(--text-primary)', maxHeight: '120px' }}
@@ -198,18 +309,28 @@ export default function ChatPage() {
                 e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px'
               }}
             />
-            <button onClick={handleSend}
-              disabled={!input.trim() || loading || !hasProvider}
-              className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors cursor-pointer flex-shrink-0"
-              style={{
-                background: input.trim() && hasProvider ? 'var(--accent)' : 'var(--bg-tertiary)',
-                color: input.trim() && hasProvider ? '#fff' : 'var(--text-muted)',
-              }}>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <line x1="22" y1="2" x2="11" y2="13" />
-                <polygon points="22 2 15 22 11 13 2 9 22 2" />
-              </svg>
-            </button>
+            {loading ? (
+              <button onClick={handleStop}
+                className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors cursor-pointer flex-shrink-0"
+                style={{ background: 'var(--danger)', color: '#fff' }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="6" y="6" width="12" height="12" rx="2" />
+                </svg>
+              </button>
+            ) : (
+              <button onClick={handleSend}
+                disabled={!input.trim() || !hasProvider}
+                className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors cursor-pointer flex-shrink-0"
+                style={{
+                  background: input.trim() && hasProvider ? 'var(--accent)' : 'var(--bg-tertiary)',
+                  color: input.trim() && hasProvider ? '#fff' : 'var(--text-muted)',
+                }}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="22" y1="2" x2="11" y2="13" />
+                  <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                </svg>
+              </button>
+            )}
           </div>
         </div>
       </div>
